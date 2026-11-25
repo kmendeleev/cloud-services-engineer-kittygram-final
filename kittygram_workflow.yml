@@ -1,0 +1,142 @@
+name: Kittygram
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kittygram-production
+  cancel-in-progress: false
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:13
+        env:
+          POSTGRES_DB: kittygram_test
+          POSTGRES_USER: kittygram
+          POSTGRES_PASSWORD: local_test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U kittygram -d kittygram_test"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Проверить бэкенд
+        working-directory: backend
+        env:
+          POSTGRES_DB: kittygram_test
+          POSTGRES_USER: kittygram
+          POSTGRES_PASSWORD: local_test_password
+          DB_HOST: 127.0.0.1
+          SECRET_KEY: local_test_secret
+        run: |
+          python -m pip install -r requirements.txt flake8==7.3.0
+          python -m flake8 --max-line-length=88 --extend-exclude=migrations .
+          python manage.py test
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+      - name: Проверить фронтенд
+        working-directory: frontend
+        run: |
+          npm ci
+          npm test -- --watchAll=false --runInBand
+      - name: Проверить файлы для ревью
+        run: |
+          cmp .github/workflows/main.yml kittygram_workflow.yml
+          python -m pytest tests/test_files.py
+
+  publish:
+    needs: tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { image: kittygram_backend, context: backend }
+          - { image: kittygram_frontend, context: frontend }
+          - { image: kittygram_gateway, context: nginx }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          username: cuberbeer
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          push: true
+          tags: |
+            cuberbeer/${{ matrix.image }}:${{ github.sha }}
+            cuberbeer/${{ matrix.image }}:latest
+
+  deploy:
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: appleboy/scp-action@v1
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          source: docker-compose.production.yml
+          target: kittygram/
+      - uses: appleboy/ssh-action@v1
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          envs: IMAGE_TAG
+          script: |
+            set -eu
+            cd ~/kittygram
+            compose() {
+              sudo -n env IMAGE_TAG="$IMAGE_TAG" docker compose -f docker-compose.production.yml "$@"
+            }
+            compose pull
+            compose run --rm backend python manage.py migrate --noinput
+            compose run --rm backend python manage.py collectstatic --noinput
+            compose up -d
+            printf 'IMAGE_TAG=%s\n' "$IMAGE_TAG" > .release.env.tmp
+            mv .release.env.tmp .release.env
+
+  auto_tests:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Проверить опубликованный Kittygram
+        run: |
+          python -m pip install -r backend/requirements.txt
+          url=$(python -c "import yaml; print(yaml.safe_load(open('tests.yml'))['kittygram_domain'])")
+          curl --fail --silent --show-error --retry 8 --retry-all-errors --retry-delay 3 --max-time 10 -o /dev/null "$url"
+          python -m pytest tests/
+
+  telegram:
+    needs: auto_tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Отправить сообщение
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          curl --fail --silent --show-error -o /dev/null \
+            --data-urlencode "chat_id=$CHAT_ID" \
+            --data-urlencode "text=Kittygram обновлён. Проверки прошли. Коммит $GITHUB_SHA" \
+            "https://api.telegram.org/bot$BOT_TOKEN/sendMessage"
